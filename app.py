@@ -19,8 +19,10 @@ from langchain_chroma import Chroma
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain.memory import ConversationBufferMemory
 from langchain.chains import ConversationalRetrievalChain
+from langchain_core.callbacks import StdOutCallbackHandler
 
-# Configure logging
+# Configure logging for app initialization and vector store operations
+# (StdOutCallbackHandler will handle chain execution logging)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
@@ -44,45 +46,42 @@ if not os.getenv('OPENAI_API_KEY'):
 def build_vector_store():
     """Build the vector store from knowledge base documents."""
     logger.info("Building vector store from knowledge base...")
-    
+
     # Check if knowledge base exists
     if not os.path.exists(KNOWLEDGE_BASE_DIR):
         raise FileNotFoundError(f"Knowledge base directory '{KNOWLEDGE_BASE_DIR}' not found!")
-    
+
     # Load documents
     folders = glob.glob(f"{KNOWLEDGE_BASE_DIR}/*")
     text_loader_kwargs = {"encoding": "utf-8"}
-    
+
     documents = []
     for folder in folders:
         doc_type = os.path.basename(folder)
         loader = DirectoryLoader(
-            folder, 
-            glob="**/*.md", 
-            loader_cls=TextLoader, 
-            loader_kwargs=text_loader_kwargs
+            folder,
+            glob="**/*.md",
+            loader_cls=TextLoader,
+            loader_kwargs=text_loader_kwargs,
         )
         folder_docs = loader.load()
         for doc in folder_docs:
             doc.metadata["doc_type"] = doc_type
             documents.append(doc)
-    
+
     if not documents:
         raise ValueError(f"No documents found in {KNOWLEDGE_BASE_DIR}!")
-    
+
     logger.info(f"Loaded {len(documents)} documents")
-    
+
     # Split documents into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000, 
-        chunk_overlap=200
-    )
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     chunks = text_splitter.split_documents(documents)
     logger.info(f"Created {len(chunks)} document chunks")
-    
+
     # Create embeddings and vector store
     embeddings = OpenAIEmbeddings()
-    
+
     # Delete existing collection if it exists
     if os.path.exists(DB_NAME):
         try:
@@ -90,14 +89,14 @@ def build_vector_store():
             logger.info("Deleted existing vector store")
         except Exception as e:
             logger.warning(f"Could not delete existing collection: {e}")
-    
+
     # Create new vector store
     vectorstore = Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
         persist_directory=DB_NAME
     )
-    
+
     logger.info(f"Vector store created successfully at {DB_NAME}")
     return vectorstore
 
@@ -105,7 +104,10 @@ def build_vector_store():
 def initialize_app():
     """Initialize the application - build vector store if needed."""
     embeddings = OpenAIEmbeddings()
-    
+
+    # Create callback handler for LangChain output
+    callback_handler = StdOutCallbackHandler()
+
     # Check if vector store exists
     if not os.path.exists(DB_NAME) or not os.path.exists(f"{DB_NAME}/chroma.sqlite3"):
         logger.info("Vector store not found. Building it now...")
@@ -113,36 +115,38 @@ def initialize_app():
         logger.info("Vector store built successfully!")
     else:
         logger.info("Using existing vector store")
-    
+
     # Load vector store
     vectorstore = Chroma(persist_directory=DB_NAME, embedding_function=embeddings)
-    
+
     # Create retriever
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
-    
-    # Create LLM
-    llm = ChatOpenAI(temperature=0.7, model_name=MODEL)
-    
+
+    # Create LLM with callback handler
+    llm = ChatOpenAI(temperature=0.7, model_name=MODEL, callbacks=[callback_handler])
+
     # Create memory
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         return_messages=True
     )
-    
-    # Create conversation chain
+
+    # Create conversation chain with callback handler
     conversation_chain = ConversationalRetrievalChain.from_llm(
         llm=llm,
         retriever=retriever,
-        memory=memory
+        memory=memory,
+        callbacks=[callback_handler],
+        verbose=True,
     )
-    
-    return retriever, conversation_chain
+
+    return retriever, conversation_chain, callback_handler
 
 
 # Initialize components
 logger.info("Initializing application...")
 try:
-    retriever, conversation_chain = initialize_app()
+    retriever, conversation_chain, callback_handler = initialize_app()
     logger.info("Application initialized successfully!")
 except Exception as e:
     logger.error(f"Failed to initialize application: {e}")
@@ -153,26 +157,16 @@ def chat(message, history):
     """Handle chat messages and return responses."""
     if not message or not message.strip():
         return "Please enter a question."
-    
+
     try:
-        # Log the user's question
-        logger.info(f"User question: {message}")
-        
-        # Retrieve and log relevant documents
-        try:
-            retrieved_docs = retriever.get_relevant_documents(message)
-        except AttributeError:
-            # Fallback for newer LangChain versions
-            retrieved_docs = retriever.invoke(message)
-        logger.info(f"Retrieved {len(retrieved_docs)} document chunks")
-        
-        # Get response from chain
-        response = conversation_chain.invoke({"question": message})
+        # Get response from chain (StdOutCallbackHandler will show chain execution details)
+        response = conversation_chain.invoke(
+            {"question": message}, config={"callbacks": [callback_handler]}
+        )
         answer = response["answer"]
-        
-        logger.info("Response generated successfully")
+
         return answer
-        
+
     except Exception as e:
         logger.error(f"Error processing question: {e}")
         return f"I encountered an error: {str(e)}. Please try again."
@@ -186,9 +180,11 @@ def reset_memory():
         return_messages=True
     )
     conversation_chain = ConversationalRetrievalChain.from_llm(
-        llm=ChatOpenAI(temperature=0.7, model_name=MODEL),
+        llm=ChatOpenAI(temperature=0.7, model_name=MODEL, callbacks=[callback_handler]),
         retriever=retriever,
-        memory=memory
+        memory=memory,
+        callbacks=[callback_handler],
+        verbose=True,
     )
     logger.info("Conversation memory reset")
     return "Conversation memory has been reset!"
@@ -206,7 +202,7 @@ with gr.Blocks(title="Insurellm RAG Chatbot", theme=gr.themes.Soft()) as demo:
         based on the knowledge base documents.
         """
     )
-    
+
     with gr.Row():
         with gr.Column(scale=4):
             chatbot = gr.ChatInterface(
@@ -221,13 +217,13 @@ with gr.Blocks(title="Insurellm RAG Chatbot", theme=gr.themes.Soft()) as demo:
                     "Who are the employees?",
                 ],
             )
-        
+
         with gr.Column(scale=1):
             gr.Markdown("### Controls")
             reset_btn = gr.Button("🔄 Reset Memory", variant="secondary")
             reset_output = gr.Textbox(label="Status", interactive=False)
             reset_btn.click(fn=reset_memory, outputs=reset_output)
-            
+
             gr.Markdown(
                 """
                 ### About
@@ -238,7 +234,7 @@ with gr.Blocks(title="Insurellm RAG Chatbot", theme=gr.themes.Soft()) as demo:
                 - **Conversational memory** for context
                 """
             )
-    
+
     gr.Markdown(
         """
         ---
